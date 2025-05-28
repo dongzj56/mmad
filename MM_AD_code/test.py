@@ -211,7 +211,7 @@ if __name__ == '__main__':
     test_data = load_test_data(cfg)
     
     # 指定checkpoint目录
-    checkpoint_dir = "checkpoints-PET"
+    checkpoint_dir = "/root/shared-nvme/MM_AD_code/checkpoints/526DATA-8MCI"
     
     # 运行测试
     test_models(checkpoint_dir, test_data)

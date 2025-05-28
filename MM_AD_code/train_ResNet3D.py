@@ -182,7 +182,7 @@ def train():
 
         # 早停机制
         best_metric = -np.inf  # 初始化为负无穷
-        patience = 5
+        patience = 10
         no_improve = 0
 
         for epoch in range(1, cfg.num_epochs + 1):
