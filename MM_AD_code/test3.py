@@ -15,7 +15,7 @@ from datasets.ADNI import ADNI, ADNI_transform
 from sklearn.model_selection import train_test_split
 from monai.data import Dataset
 
-def load_config(path="config/config.json"):
+def load_config(path="config/config3.json"):
     with open(path) as f:
         return json.load(f)
 
@@ -211,7 +211,7 @@ if __name__ == '__main__':
     test_data = load_test_data(cfg)
     
     # 指定checkpoint目录
-    checkpoint_dir = "/root/shared-nvme/MM_AD_code/checkpoints/6-1/WM-ADCN"
+    checkpoint_dir = "/root/shared-nvme/MM_AD_code/checkpoints/6-1/PET-ADCN"
     
     # 运行测试
     test_models(checkpoint_dir, test_data)
