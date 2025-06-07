@@ -1,0 +1,24 @@
+{
+  "dataroot": "C:\\Users\\dongz\\Desktop\\adni_dataset",
+  "label_file": "C:\\Users\\dongz\\Desktop\\adni_dataset\\ADNI.csv",
+  "mri_dir": "C:\\Users\\dongz\\Desktop\\adni_dataset\\MRI-GM",
+  "task": "ADCN",
+  "augment": false,
+  "split_ratio": 0.2,
+  "seed": 42,
+  "num_epochs": 100,
+  "batch_size": 4,
+  "lr": 1e-5,
+  "checkpoint_dir": "./checkpoints",
+  "log_file": "training_log1.csv",
+
+  "model_type":"resnet",
+  "model_depth": 50,
+  "input_W": 80,
+  "input_H": 98,
+  "input_D": 80,
+  "resnet_shortcut": "B",
+  "pretrain_path": "config/pretrain/resnet_50_23dataset.pth",
+  "nb_class": 2
+
+}

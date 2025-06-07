@@ -1,7 +1,6 @@
 import os
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
-from collections import Counter
 from sklearn.model_selection import train_test_split
 from monai.transforms import (
     EnsureChannelFirstd,
@@ -24,20 +23,18 @@ class ADNI(Dataset):
         """
         初始化ADNI数据集类，读取数据和标签文件，并生成数据字典
 
-        :param label_file: 标签文件路径（包含 Group 和 Subject_ID 等信息）
+        :param label_file: 标签文件路径（包含 Group 和 Subject ID 等信息）
         :param mri_dir: MRI图像所在目录
         :param task: 任务类型，用于选择不同标签类别
         :param augment: 是否进行数据增强
         """
-        # self.label = pd.read_csv(label_file)
-        self.label = pd.read_csv(label_file, encoding='ISO-8859-1')
+        self.label = pd.read_csv(label_file)
         self.mri_dir = mri_dir
         self.task = task
         self.augment = augment
 
         self._process_labels()
         self._build_data_dict()
-        self._print_class_counts()
 
     def _process_labels(self):
         """根据指定的任务从标签 CSV 文件中提取数据标签"""
@@ -53,12 +50,9 @@ class ADNI(Dataset):
         if self.task == 'EMCILMCI':
             self.labels = self.label[(self.label['Group'] == 'EMCI') | (self.label['Group'] == 'LMCI')]
             self.label_dict = {'EMCI': 0, 'LMCI': 1}
-        if self.task == 'SMCIPMCI':
-            self.labels = self.label[(self.label['Group'] == 'SMCI') | (self.label['Group'] == 'PMCI')]
-            self.label_dict = {'SMCI': 0, 'PMCI': 1}
 
     def _build_data_dict(self):
-        subject_list = self.labels['Subject_ID'].tolist()
+        subject_list = self.labels['Subject ID'].tolist()
         label_list = self.labels['Group'].tolist()
         self.data_dict = [
             {
@@ -67,15 +61,6 @@ class ADNI(Dataset):
                 'Subject': subject
             } for subject, group in zip(subject_list, label_list)
         ]
-
-    def _print_class_counts(self):
-        """打印当前 data_dict 里每个 label 的样本数量。"""
-        inv = {v: k for k, v in self.label_dict.items()}
-        cnt = Counter(sample['label'] for sample in self.data_dict)
-        print(f"\n[ADNI Dataset: {self.task}] 样本分布：")
-        for lbl_value, num in cnt.items():
-            print(f"  {inv[lbl_value]} ({lbl_value}): {num}")
-        print()
 
     def __len__(self):
         return len(self.data_dict)
