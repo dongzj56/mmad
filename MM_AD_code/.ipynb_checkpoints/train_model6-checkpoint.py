@@ -21,7 +21,7 @@ from datasets.ADNI import ADNI, ADNI_transform
 from sklearn.metrics import roc_curve, auc
 import matplotlib.pyplot as plt
 
-def load_config(path="config/config.json"):
+def load_config(path="config/config6.json"):
     with open(path) as f:
         return json.load(f)
 

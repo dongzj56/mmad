@@ -1,0 +1,9 @@
+tqdm==4.67.1
+monai==1.4.0
+pandas==2.2.3
+scikit-learn==1.6.1
+numpy==1.26.4
+matplotlib==3.10.3
+tensorboard==2.19.0
+nibabel==5.3.2
+SimpleITK==2.5.0

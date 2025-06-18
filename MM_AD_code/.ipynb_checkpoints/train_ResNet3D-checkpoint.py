@@ -7,19 +7,19 @@ from multiprocessing import freeze_support
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import ExponentialLR, CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, f1_score,
     precision_score, recall_score, confusion_matrix
 )
+from ptflops import get_model_complexity_info  # pip install ptflops
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from monai.data import Dataset
 from models import resnet
 from datasets.ADNI import ADNI, ADNI_transform
-from sklearn.metrics import roc_curve, auc
-import matplotlib.pyplot as plt
+
 
 def load_config(path="config/config.json"):
     with open(path) as f:
@@ -42,7 +42,7 @@ class Config:
 
 
 def generate_model(model_type='resnet', model_depth=50,
-                   input_W=112, input_H=136, input_D=112,
+                   input_W=224, input_H=224, input_D=224,
                    resnet_shortcut='B',
                    pretrain_path='config/pretrain/resnet_50_23dataset.pth',
                    nb_class=2,  # 修改为2分类输出
@@ -88,16 +88,14 @@ def calculate_metrics(y_true, y_pred, y_score):
     return {
         'acc': accuracy_score(y_true, y_pred),
         'auc': roc_auc_score(y_true, y_score),
-        'f1': f1_score(y_true, y_pred, zero_division=0),
-        'precision': precision_score(y_true, y_pred, zero_division=0),
-        'recall': recall_score(y_true, y_pred, zero_division=0),
+        'f1': f1_score(y_true, y_pred),
+        'precision': precision_score(y_true, y_pred),
+        'recall': recall_score(y_true, y_pred),
         'cm': confusion_matrix(y_true, y_pred)
     }
 
 
 def train():
-    torch.manual_seed(42)
-    np.random.seed(42)
     cfg = Config(load_config())
 
     # 加载数据
@@ -139,51 +137,21 @@ def train():
             input_W=cfg.input_W, input_H=cfg.input_H, input_D=cfg.input_D,
             resnet_shortcut=cfg.resnet_shortcut,
             pretrain_path=cfg.pretrain_path,
-            nb_class=2,
+            nb_class=2,  # 强制设为2分类
             dropout_rate=cfg.dropout_rate,
             device=device
         )
-        
-        # 计算类别权重
-        class_counts = np.bincount([d['label'] for d in train_data])
-        class_weights = torch.tensor(1.0 / class_counts, dtype=torch.float32).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)  # 带权重的损失函数
-
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=cfg.lr,
             weight_decay=cfg.weight_decay
         )
-
-        # 超参
-        warmup_epochs = max(1, min(10, int(cfg.num_epochs * 0.1)))
-        total_epochs = cfg.num_epochs
-        cosine_epochs = total_epochs - warmup_epochs
-        min_lr = cfg.lr * 1e-4
-
-        # 学习率调度器（保持原有结构）
-        warmup_sched = LinearLR(
-            optimizer,
-            start_factor=0.1,
-            end_factor=1.0,
-            total_iters=warmup_epochs
-        )
-        cosine_sched = CosineAnnealingLR(
-            optimizer,
-            T_max=cosine_epochs,
-            eta_min=min_lr,
-            last_epoch=-1  # 确保每次从头开始
-        )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup_sched, cosine_sched],
-            milestones=[warmup_epochs]
-        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs, eta_min=cfg.lr * 1e-2)
 
         # 早停机制
-        best_metric = -np.inf  # 初始化为负无穷
-        # patience = 10
-        # no_improve = 0
+        best_vl_auc = 0
+        patience = 5
+        no_improve = 0
 
         for epoch in range(1, cfg.num_epochs + 1):
             t0 = time.time()
@@ -195,12 +163,10 @@ def train():
                 x = batch['MRI'].to(device)
                 y = batch['label'].to(device).squeeze().long()  # 确保为LongTensor
                 out = model(x)
-                loss = criterion(out, y)
+                loss = nn.CrossEntropyLoss()(out, y)
                 loss_sum += loss.item()
-                optimizer.zero_grad()
-                # 在optimizer.step()之前添加梯度裁剪
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.zero_grad();
+                loss.backward();
                 optimizer.step()
 
                 probs = torch.softmax(out, 1)[:, 1].detach().cpu().numpy()
@@ -213,7 +179,7 @@ def train():
             tr_metrics = calculate_metrics(y_true, y_pred, y_score)
             tr_loss = loss_sum / len(loader_tr)
 
-            # 验证集评估（优化后的softmax计算）
+            # 验证集评估
             model.eval()
             v_true, v_pred, v_score = [], [], []
             vl_loss = 0.0
@@ -225,10 +191,11 @@ def train():
                     loss = nn.CrossEntropyLoss()(out, y)
                     vl_loss += loss.item()
 
-                    probs = torch.softmax(out, 1)  # 只计算一次softmax
-                    v_score.extend(probs[:, 1].cpu().numpy())
-                    v_pred.extend(out.argmax(1).cpu().numpy())
+                    probs = torch.softmax(out, 1)[:, 1].cpu().numpy()
+                    preds = out.argmax(1).cpu().numpy()
                     v_true.extend(y.cpu().numpy())
+                    v_score.extend(probs)
+                    v_pred.extend(preds)
 
             vl_metrics = calculate_metrics(v_true, v_pred, v_score)
             vl_loss = vl_loss / len(loader_vl)
@@ -247,100 +214,57 @@ def train():
             with open(csv_path, 'a', newline='') as f:
                 csv.writer(f).writerow([
                     fold, epoch,
-                    f"{tr_metrics['acc']:.6f}", f"{tr_metrics['auc']:.6f}", f"{tr_loss:.6f}",
-                    f"{vl_metrics['acc']:.6f}", f"{vl_metrics['auc']:.6f}", f"{vl_loss:.6f}",
+                    f"{tr_metrics['acc']:.4f}", f"{tr_metrics['auc']:.4f}", f"{tr_loss:.4f}",
+                    f"{vl_metrics['acc']:.4f}", f"{vl_metrics['auc']:.4f}", f"{vl_loss:.4f}",
                     f"{lr_now:.6f}"
                 ])
 
             print(f"Fold{fold} Ep{epoch:03d} | "
-                  f"tr_acc={tr_metrics['acc']:.6f}(AUC={tr_metrics['auc']:.6f}) "
-                  f"vl_acc={vl_metrics['acc']:.6f}(AUC={vl_metrics['auc']:.6f}) "
-                  f"lr={lr_now:.7f} time={time.time() - t0:.3f}s")
+                  f"tr_acc={tr_metrics['acc']:.3f}(AUC={tr_metrics['auc']:.3f}) "
+                  f"vl_acc={vl_metrics['acc']:.3f}(AUC={vl_metrics['auc']:.3f}) "
+                  f"lr={lr_now:.6f} time={time.time() - t0:.1f}s")
 
             # 早停判断
-            current_metric = 0.3 * vl_metrics['auc'] + 0.7 * vl_metrics['acc']
-            if current_metric > best_metric:
-                best_metric = current_metric
-                # no_improve = 0
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'metrics': {
-                        'train_auc': tr_metrics['auc'],
-                        'val_auc': vl_metrics['auc'],
-                        'val_loss': vl_loss,
-                        'current_metric': current_metric
-                    },
-                    'config': vars(cfg)  # 保存当前配置
-                }, os.path.join(cfg.checkpoint_dir, f"best_fold{fold}.pth"))
-            # else:
-            #     no_improve += 1
-            #     if no_improve >= patience:
-            #         print(f"Early stopping at epoch {epoch}")
-            #         break
+            if vl_metrics['auc'] > best_vl_auc:
+                best_vl_auc = vl_metrics['auc']
+                no_improve = 0
+                torch.save(model.state_dict(), os.path.join(cfg.checkpoint_dir, f"best_fold{fold}.pth"))
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
 
         # 保存最终epoch模型
-        torch.save({
-            'epoch': cfg.num_epochs,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'final_metrics': {
-                'train_auc': tr_metrics['auc'],
-                'val_auc': vl_metrics['auc'],
-                'val_loss': vl_loss
-            }
-        }, os.path.join(cfg.checkpoint_dir, f"model_fold{fold}_final.pth"))
+        torch.save(model.state_dict(),
+                   os.path.join(cfg.checkpoint_dir, f"model_fold{fold}_final.pth"))
 
     print("\n=== CV complete ===")
-    
-    '''测试集'''
-    # 指定checkpoint目录
-    checkpoint_dir = cfg.checkpoint_dir
-    
-    # 运行测试
-    test_models(checkpoint_dir, test_data)
-    writer.close()
 
-def test_models(checkpoint_dir, test_data):
-    """主测试函数"""
-    cfg = Config(load_config())
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    
-    # 数据准备
+    # 测试集评估示例（需补充测试集DataLoader）
     test_transforms = ADNI_transform(augment=False)[1]
     test_ds = Dataset(data=test_data, transform=test_transforms)
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
 
-    # 存储结果
-    all_metrics = []
-    all_fold_probs = []
-    all_fold_labels = []
-    plt.figure(figsize=(10, 8))
-    
-    for fold in range(1, cfg.n_splits + 1):
-        # 加载模型
-        model = generate_model(
-            model_type=cfg.model_type,
-            model_depth=cfg.model_depth,
-            input_W=cfg.input_W,
-            input_H=cfg.input_H,
-            input_D=cfg.input_D,
-            resnet_shortcut=cfg.resnet_shortcut,
-            nb_class=2,
-            dropout_rate=cfg.dropout_rate,
-            device=device
-        )
-        
-        # 加载checkpoint
-        checkpoint_path = os.path.join(checkpoint_dir, f"best_fold{fold}.pth")
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
+    def ensemble_evaluation(test_loader, cfg, device):
+        models = []
+        # 加载所有fold的最佳模型
+        for fold in range(1, cfg.n_splits + 1):
+            model_path = os.path.join(cfg.checkpoint_dir, f"best_fold{fold}.pth")
+            model = generate_model(
+                model_type=cfg.model_type, model_depth=cfg.model_depth,
+                input_W=cfg.input_W, input_H=cfg.input_H, input_D=cfg.input_D,
+                resnet_shortcut=cfg.resnet_shortcut,
+                pretrain_path=cfg.pretrain_path,
+                nb_class=2,
+                dropout_rate=cfg.dropout_rate,
+                device=device
+            )
+            model.load_state_dict(torch.load(model_path))
+            model.eval()
+            models.append(model)
 
-        # 测试评估
+        # 集成预测
         all_probs = []
         y_true = []
         with torch.no_grad():
@@ -348,74 +272,28 @@ def test_models(checkpoint_dir, test_data):
                 x = batch['MRI'].to(device)
                 y = batch['label'].squeeze().cpu().numpy()
                 y_true.extend(y)
-                out = model(x)
-                probs = torch.softmax(out, dim=1)[:, 1].cpu().numpy()
-                all_probs.extend(probs)
 
-        # 存储当前折结果
-        all_fold_probs.extend(all_probs)
-        all_fold_labels.extend(y_true)
+                # 各模型预测概率取平均
+                prob = 0
+                for model in models:
+                    out = model(x)
+                    prob += torch.softmax(out, dim=1)[:, 1].cpu().numpy()
+                prob /= len(models)
+                all_probs.extend(prob)
 
         # 计算指标
         y_pred = (np.array(all_probs) > 0.5).astype(int)
         metrics = calculate_metrics(y_true, y_pred, all_probs)
-        all_metrics.append(metrics)
 
-        # 绘制单折ROC曲线（半透明）
-        fpr, tpr, _ = roc_curve(y_true, all_probs)
-        plt.plot(fpr, tpr, lw=1, alpha=0.3, 
-                label=f'Fold {fold} (AUC={auc(fpr, tpr):.2f})')
-
-        # 打印结果
-        print(f"\n=== Fold {fold} Test Metrics ===")
+        print("\n=== Test Set Metrics ===")
         print(f"AUC: {metrics['auc']:.4f}")
         print(f"Accuracy: {metrics['acc']:.4f}")
         print(f"F1 Score: {metrics['f1']:.4f}")
         print("Confusion Matrix:\n", metrics['cm'])
 
-    # 绘制合并后的平滑ROC曲线
-    fpr, tpr, _ = roc_curve(all_fold_labels, all_fold_probs)
-    roc_auc = auc(fpr, tpr)
-    mean_fpr = np.linspace(0, 1, 100)
-    interp_tpr = np.interp(mean_fpr, fpr, tpr)
-    plt.plot(mean_fpr, interp_tpr, 'b-', lw=2, 
-            label=f'Mean ROC (AUC={roc_auc:.2f})')
+    ensemble_evaluation(test_loader, cfg, device)
 
-    # 计算平均指标
-    avg_metrics = {
-        k: np.mean([m[k] for m in all_metrics]) 
-        for k in all_metrics[0].keys() if k != 'cm'
-    }
-    std_metrics = {
-        k: np.std([m[k] for m in all_metrics])
-        for k in all_metrics[0].keys() if k != 'cm'
-    }
-
-    # 完善图表
-    plt.plot([0, 1], [0, 1], 'k--', lw=2)
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Test ROC Curves')
-    plt.legend(loc="lower right")
-    
-    # 保存结果
-    roc_path = os.path.join(checkpoint_dir, 'test_roc_curves.png')
-    plt.savefig(roc_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"\nROC曲线已保存至: {roc_path}")
-
-    # 打印最终结果
-    print("\n=== Final Test Results ===")
-    for metric in ['auc', 'acc', 'f1', 'precision', 'recall']:
-        print(f"{metric.upper()}: {avg_metrics[metric]:.4f} ± {std_metrics[metric]:.4f}")
-    
-    return avg_metrics, std_metrics
 
 if __name__ == '__main__':
     freeze_support()
     train()
-
-# cd baseline_MRI_3D
-# python train_ResNet3D.py

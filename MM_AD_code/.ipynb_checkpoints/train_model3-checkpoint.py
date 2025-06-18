@@ -21,7 +21,7 @@ from datasets.ADNI import ADNI, ADNI_transform
 from sklearn.metrics import roc_curve, auc
 import matplotlib.pyplot as plt
 
-def load_config(path="config/config.json"):
+def load_config(path="config/config3.json"):
     with open(path) as f:
         return json.load(f)
 
@@ -42,7 +42,7 @@ class Config:
 
 
 def generate_model(model_type='resnet', model_depth=50,
-                   input_W=112, input_H=136, input_D=112,
+                   input_W=224, input_H=224, input_D=224,
                    resnet_shortcut='B',
                    pretrain_path='config/pretrain/resnet_50_23dataset.pth',
                    nb_class=2,  # 修改为2分类输出
