@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import (
-    roc_auc_score, accuracy_score, f1_score,
+    matthews_corrcoef, roc_auc_score, accuracy_score, f1_score,
     precision_score, recall_score, confusion_matrix,
     roc_curve, auc  # Add these imports
 )
@@ -14,8 +14,10 @@ from models import resnet
 from datasets.ADNI import ADNI, ADNI_transform
 from sklearn.model_selection import train_test_split
 from monai.data import Dataset
+from thop import profile
 
-def load_config(path="config/config2.json"):
+
+def load_config(path="/root/shared-nvme/MM_AD_code/config/config.json"):
     with open(path) as f:
         return json.load(f)
 
@@ -73,14 +75,28 @@ def generate_model(model_type='resnet', model_depth=50,
         print(f"[Warning] no pretrained file at {pretrain_path}")
     return net
 
+# 计算指标
 def calculate_metrics(y_true, y_pred, y_score):
+    """
+    返回字典中键的排列顺序：ACC → PRE → SEN → SPE → F1 → AUC → MCC
+    """
+    # 混淆矩阵：[[TN, FP], [FN, TP]]
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+    # 7 个指标
+    acc  = accuracy_score(y_true, y_pred)                       # ACC
+    pre  = precision_score(y_true, y_pred, zero_division=0)     # PRE
+    sen  = recall_score(y_true, y_pred, zero_division=0)        # SEN (=TPR)
+    spe  = tn / (tn + fp + 1e-8)                                # SPE (=TNR)
+    f1   = f1_score(y_true, y_pred, zero_division=0)            # F1
+    auc  = roc_auc_score(y_true, y_score)                       # AUC
+    mcc  = matthews_corrcoef(y_true, y_pred)                    # MCC
+
     return {
-        'acc': accuracy_score(y_true, y_pred),
-        'auc': roc_auc_score(y_true, y_score),
-        'f1': f1_score(y_true, y_pred, zero_division=0),
-        'precision': precision_score(y_true, y_pred, zero_division=0),
-        'recall': recall_score(y_true, y_pred, zero_division=0),
-        'cm': confusion_matrix(y_true, y_pred)
+        'ACC': acc, 'PRE': pre, 'SEN': sen, 'SPE': spe,
+        'F1': f1, 'AUC': auc, 'MCC': mcc,
+        'cm': np.array([[tn, fp],
+                        [fn, tp]])    
     }
 
 def load_test_data(cfg):
@@ -108,100 +124,118 @@ def test_models(checkpoint_dir, test_data):
     all_metrics = []
     all_fold_probs = []
     all_fold_labels = []
-    plt.figure(figsize=(10, 8))
-    
-    for fold in range(1, cfg.n_splits + 1):
-        # 加载模型
-        model = generate_model(
-            model_type=cfg.model_type,
-            model_depth=cfg.model_depth,
-            input_W=cfg.input_W,
-            input_H=cfg.input_H,
-            input_D=cfg.input_D,
-            resnet_shortcut=cfg.resnet_shortcut,
-            nb_class=2,
-            dropout_rate=cfg.dropout_rate,
-            device=device
-        )
-        
-        # 加载checkpoint
-        checkpoint_path = os.path.join(checkpoint_dir, f"best_fold{fold}.pth")
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
 
-        # 测试评估
-        all_probs = []
-        y_true = []
-        with torch.no_grad():
-            for batch in test_loader:
-                x = batch['MRI'].to(device)
-                y = batch['label'].squeeze().cpu().numpy()
-                y_true.extend(y)
-                out = model(x)
-                probs = torch.softmax(out, dim=1)[:, 1].cpu().numpy()
-                all_probs.extend(probs)
+    # 打开结果文件
+    results_path = os.path.join(checkpoint_dir, 'test_result.txt')
+    with open(results_path, 'w') as result_file:
+        result_file.write("=== Test Results by Fold ===\n\n")
 
-        # 存储当前折结果
-        all_fold_probs.extend(all_probs)
-        all_fold_labels.extend(y_true)
+        plt.figure(figsize=(10, 8))
+        for fold in range(1, cfg.n_splits + 1):
+            # 加载模型
+            model = generate_model(
+                model_type=cfg.model_type,
+                model_depth=cfg.model_depth,
+                input_W=cfg.input_W,
+                input_H=cfg.input_H,
+                input_D=cfg.input_D,
+                resnet_shortcut=cfg.resnet_shortcut,
+                nb_class=2,
+                dropout_rate=cfg.dropout_rate,
+                device=device
+            )
+            ckpt_path = os.path.join(checkpoint_dir, f"model_fold{fold}.pth")
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.eval()
 
-        # 计算指标
-        y_pred = (np.array(all_probs) > 0.5).astype(int)
-        metrics = calculate_metrics(y_true, y_pred, all_probs)
-        all_metrics.append(metrics)
+            # —— 新增：计算 Params, FLOPs, Memory —— 
+            dummy_input = torch.randn(1, 1, cfg.input_W, cfg.input_H, cfg.input_D).to(device)
+            flops, params = profile(model, inputs=(dummy_input,), verbose=False)
+            # 参数量与内存开销
+            total_params = params
+            mem_bytes = total_params * 4  # 假设 float32，每个参数 4 字节
+            mem_mb = mem_bytes / (1024**2)
+            flops_g = flops / 1e9  # 转为 GFLOPs
 
-        # 绘制单折ROC曲线（半透明）
-        fpr, tpr, _ = roc_curve(y_true, all_probs)
-        plt.plot(fpr, tpr, lw=1, alpha=0.3, 
-                label=f'Fold {fold} (AUC={auc(fpr, tpr):.2f})')
+            info_line = (
+                f"Fold {fold} Model Complexity:\n"
+                f"  Params: {total_params:,} ({mem_mb:.2f} MB)\n"
+                f"  FLOPs: {flops_g:.3f} GFLOPs\n\n"
+            )
+            print(info_line, end='')
+            result_file.write(info_line)
+            # — end 新增 —
 
-        # 打印结果
-        print(f"\n=== Fold {fold} Test Metrics ===")
-        print(f"AUC: {metrics['auc']:.4f}")
-        print(f"Accuracy: {metrics['acc']:.4f}")
-        print(f"F1 Score: {metrics['f1']:.4f}")
-        print("Confusion Matrix:\n", metrics['cm'])
+            # 预测
+            fold_probs = []
+            y_true = []
+            with torch.no_grad():
+                for batch in test_loader:
+                    x = batch['MRI'].to(device)
+                    y = batch['label'].squeeze().cpu().numpy()
+                    y_true.extend(y)
+                    out = model(x)
+                    probs = torch.softmax(out, dim=1)[:, 1].cpu().numpy()
+                    fold_probs.extend(probs)
 
-    # 绘制合并后的平滑ROC曲线
-    fpr, tpr, _ = roc_curve(all_fold_labels, all_fold_probs)
-    roc_auc = auc(fpr, tpr)
-    mean_fpr = np.linspace(0, 1, 100)
-    interp_tpr = np.interp(mean_fpr, fpr, tpr)
-    plt.plot(mean_fpr, interp_tpr, 'b-', lw=2, 
-            label=f'Mean ROC (AUC={roc_auc:.2f})')
+            all_fold_probs.extend(fold_probs)
+            all_fold_labels.extend(y_true)
 
-    # 计算平均指标
-    avg_metrics = {
-        k: np.mean([m[k] for m in all_metrics]) 
-        for k in all_metrics[0].keys() if k != 'cm'
-    }
-    std_metrics = {
-        k: np.std([m[k] for m in all_metrics])
-        for k in all_metrics[0].keys() if k != 'cm'
-    }
+            # 计算指标
+            y_pred = (np.array(fold_probs) > 0.5).astype(int)
+            metrics = calculate_metrics(y_true, y_pred, fold_probs)
+            all_metrics.append(metrics)
 
-    # 完善图表
-    plt.plot([0, 1], [0, 1], 'k--', lw=2)
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Test ROC Curves')
-    plt.legend(loc="lower right")
-    
-    # 保存结果
-    roc_path = os.path.join(checkpoint_dir, 'test_roc_curves.png')
-    plt.savefig(roc_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"\nROC曲线已保存至: {roc_path}")
+            # ROC 曲线
+            fpr, tpr, _ = roc_curve(y_true, fold_probs)
+            plt.plot(fpr, tpr, lw=1, alpha=0.3, label=f'Fold {fold} (AUC={auc(fpr, tpr):.2f})')
 
-    # 打印最终结果
-    print("\n=== Final Test Results ===")
-    for metric in ['auc', 'acc', 'f1', 'precision', 'recall']:
-        print(f"{metric.upper()}: {avg_metrics[metric]:.4f} ± {std_metrics[metric]:.4f}")
-    
-    return avg_metrics, std_metrics
+            # 打印 & 写入文件：本折结果
+            header = f"--- Fold {fold} Test Metrics ---\n"
+            print(header, end='')
+            result_file.write(header)
+            for k in ['ACC','PRE','SEN','SPE','F1','AUC','MCC']:
+                line = f"{k}: {metrics[k]:.4f}\n"
+                print(line, end='')
+                result_file.write(line)
+            cm_line = f"Confusion Matrix:\n{metrics['cm']}\n\n"
+            print(cm_line, end='')
+            result_file.write(cm_line)
+
+        # 绘制与保存合并 ROC
+        fpr, tpr, _ = roc_curve(all_fold_labels, all_fold_probs)
+        roc_auc = auc(fpr, tpr)
+        mean_fpr = np.linspace(0, 1, 100)
+        interp_tpr = np.interp(mean_fpr, fpr, tpr)
+        plt.plot(mean_fpr, interp_tpr, 'b-', lw=2, label=f'Mean ROC (AUC={roc_auc:.2f})')
+        plt.plot([0, 1], [0, 1], 'k--', lw=2)
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('Test ROC Curves')
+        plt.legend(loc="lower right")
+        roc_path = os.path.join(checkpoint_dir, 'test_roc_curves.png')
+        plt.savefig(roc_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"\nROC曲线已保存至: {roc_path}")
+
+        # 计算总体指标
+        result_file.write("=== Overall Test Results ===\n\n")
+        print("\n=== Overall Test Results ===")
+        for k in ['ACC','PRE','SEN','SPE','F1','AUC','MCC']:
+            vals = [m[k] for m in all_metrics]
+            mean, std = np.mean(vals), np.std(vals)
+            line = f"{k}: {mean:.4f} ± {std:.4f}\n"
+            print(line, end='')
+            result_file.write(line)
+
+    print(f"\n测试结果已保存至: {results_path}")
+    return (
+        {k: np.mean([m[k] for m in all_metrics]) for k in all_metrics[0] if k != 'cm'},
+        {k: np.std([m[k] for m in all_metrics])  for k in all_metrics[0] if k != 'cm'}
+    )
 
 if __name__ == '__main__':
     # 加载配置
@@ -211,7 +245,7 @@ if __name__ == '__main__':
     test_data = load_test_data(cfg)
     
     # 指定checkpoint目录
-    checkpoint_dir = "/root/shared-nvme/MM_AD_code/checkpoints/1mm/p0/ADCN"
+    checkpoint_dir = "/root/shared-nvme/MM_AD_code/checkpoints/MRI"
     
     # 运行测试
     test_models(checkpoint_dir, test_data)
