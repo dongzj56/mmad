@@ -1,0 +1,25 @@
+{
+  "dataroot": "C:/Users/dongzj/Desktop/Multimodal_AD/adni_dataset",
+  "label_file": "C:/Users/dongzj/Desktop/Multimodal_AD/adni_dataset/ADNI_902.csv",
+  "mri_dir": "C:/Users/dongzj/Desktop/Multimodal_AD/adni_dataset/PET",
+  "task": "SMCIPMCI",
+  "augment": false,
+  "split_ratio": 0.2,
+  "seed": 42,
+  "num_epochs": 50,
+  "batch_size": 8,
+  "lr": 1e-6,
+  "checkpoint_dir": "checkpoints/MCI/PET/resnet_18",
+  "log_file": "training_log.csv",
+
+  "model_type":"resnet",
+  "model_depth": 18,
+  "input_W": 91,
+  "input_H": 109,
+  "input_D": 91,
+  "resnet_shortcut": "B",
+  "pretrain_path": "config/pretrain/resnet_18.pth",
+  "nb_class": 2,
+  "n_splits":5,
+  "dropout_rate":0.5
+}
