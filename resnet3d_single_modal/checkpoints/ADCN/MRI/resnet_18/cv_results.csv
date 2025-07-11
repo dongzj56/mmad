@@ -1,1 +1,0 @@
-fold,epoch,tr_ACC,tr_PRE,tr_SEN,tr_SPE,tr_F1,tr_AUC,tr_MCC,tr_loss,vl_ACC,vl_PRE,vl_SEN,vl_SPE,vl_F1,vl_AUC,vl_MCC,vl_loss,lr
