@@ -1,0 +1,20 @@
+{
+  "label_file": "shared-nvme/adni_dataset/ADNI_902.csv",
+  "mri_dir": "shared-nvme/adni_dataset/MRI",
+  "pet_dir": "shared-nvme/adni_dataset/PET",
+  "task": "ADCN",
+  "augment": false,
+  "split_ratio": 0.2,
+  "seed": 42,
+  "device":"cuda:0",
+  "num_epochs": 100,
+  "batch_size": 8,
+  "lr": 1e-6,
+  "fp16":true,
+  "checkpoint_dir": "checkpoints",
+  "nb_class": 2,
+  "n_splits":1,
+  "dropout_rate":0.5,
+  "in_channels": 1,
+  "seg_task":false 
+}

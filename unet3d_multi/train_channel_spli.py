@@ -1,0 +1,267 @@
+import os, json, time, csv, numpy as np
+from collections import Counter, defaultdict
+import torch, torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
+from torch.utils.tensorboard import SummaryWriter
+
+from datasets.ADNI import ADNI, ADNI_transform
+from monai.data import Dataset
+
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, roc_auc_score, matthews_corrcoef,
+                             confusion_matrix, roc_curve, auc)
+from models.unet3d import UNet3DClassifier,UNet3D
+from utils.metrics import calculate_metrics
+from torch.multiprocessing import freeze_support
+
+# -------------------- 配置 --------------------
+def load_cfg(path):
+    with open(path) as f: return json.load(f)
+
+class Cfg:
+    def __init__(self, d):
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        for k, v in d.items(): 
+            setattr(self, k, v)
+
+# ----------------- 创建模型 -------------------
+def generate_model(cfg):
+    model = UNet3DClassifier(in_channels=cfg.in_channels, num_classes=cfg.nb_class).to(cfg.device)
+
+    # 参数统计
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    bytes_per_param  = 2 if getattr(cfg, 'fp16', False) else 4
+    print("--------------------model------------------")
+    print(f"Total params(M)    : {total_params:,}")
+    print(f"Trainable params(M): {trainable_params:,}")
+    print(f"Approx. size       : {total_params*bytes_per_param/1024**2:.2f} MB")
+    print("model type:", type(model).__name__)
+
+    return model
+
+def train():
+    # ----------------- 加载数据 -------------------
+    config_path = "config/config_unet3d_channel_spli.json"
+    cfg = Cfg(load_cfg(config_path))
+    for name, val in vars(cfg).items():
+        print(f"{name:15s}: {val}")
+    writer = SummaryWriter(cfg.checkpoint_dir)
+
+    fold_loaders = []                  # ⬅️ 所有折的 DataLoader 都收集到这里
+    fold_indices = defaultdict(dict)   # 可选：若想保存索引，方便调试
+
+    full_ds = ADNI(cfg.label_file, cfg.mri_dir, cfg.pet_dir,cfg.task, cfg.augment).data_dict
+    labels  = [d['label'] for d in full_ds]
+
+    outer_cv = StratifiedKFold(
+        n_splits=cfg.n_splits,     # 5 折
+        shuffle=True,
+        random_state=cfg.seed
+    )
+
+    for fold, (train_val_idx, test_idx) in enumerate(outer_cv.split(full_ds, labels), start=1):
+        train_val_ds = [full_ds[i] for i in train_val_idx]
+        test_ds      = [full_ds[i] for i in test_idx]
+
+        # —— 内层 90/10 分出验证集 —— #
+        labels_train_val = [d['label'] for d in train_val_ds]
+        idxs = np.arange(len(train_val_ds))
+        train_idx_, val_idx_ = train_test_split(
+            idxs, test_size=0.125, stratify=labels_train_val, random_state=cfg.seed
+        )
+        train_ds = [train_val_ds[i] for i in train_idx_]
+        val_ds   = [train_val_ds[i] for i in val_idx_]
+
+        print(f"\n=== Fold {fold}/{cfg.n_splits} ===")
+        print(f"训练集样本数: {len(train_ds)}  ({len(train_ds)/len(full_ds):.1%})")
+        print(f"验证集样本数: {len(val_ds)}  ({len(val_ds)/len(full_ds):.1%})")
+        print(f"测试集样本数: {len(test_ds)}  ({len(test_ds)/len(full_ds):.1%})")
+
+        # —— 构造 DataLoader —— #
+        tr_tf, vl_tf = ADNI_transform(augment=cfg.augment)
+        te_tf        = vl_tf      # 测试不做增强
+
+        tr_loader = DataLoader(
+            Dataset(train_ds, tr_tf),
+            batch_size=cfg.batch_size, shuffle=True,
+            num_workers=4, pin_memory=True
+        )
+        vl_loader = DataLoader(
+            Dataset(val_ds, vl_tf),
+            batch_size=cfg.batch_size, shuffle=False,
+            num_workers=2, pin_memory=True
+        )
+        test_loader = DataLoader(
+            Dataset(test_ds, te_tf),
+            batch_size=cfg.batch_size, shuffle=False,
+            num_workers=2, pin_memory=True
+        )
+
+        # —— 保存到列表 —— #
+        fold_loaders.append({
+            "fold"        : fold,
+            "train_loader": tr_loader,
+            "val_loader"  : vl_loader,
+            "test_loader" : test_loader
+        })
+
+        # （可选）保存索引，便于日后溯源
+        fold_indices[fold]["train_idx"] = train_idx_
+        fold_indices[fold]["val_idx"]   = val_idx_
+        fold_indices[fold]["test_idx"]  = test_idx
+
+    # 现在 fold_loaders[0] ~ fold_loaders[4] 就是 5 组 train/val/test DataLoader
+    save_path = os.path.join(cfg.checkpoint_dir, "fold_indices.json")
+    with open(save_path, "w") as f:
+        serializable = {
+            str(fold): {
+                "train_idx": v["train_idx"].tolist(),
+                "val_idx"  : v["val_idx"].tolist(),
+                "test_idx" : v["test_idx"].tolist(),
+            }
+            for fold, v in fold_indices.items()
+        }
+        json.dump(serializable, f, indent=2)
+    print(f"fold indices saved to {save_path}")
+
+    # ----------------- 五折交叉验证训练 -----------------
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+
+    for fold_idx in range(cfg.n_splits):              # cfg.n_splits == 5
+        fold = fold_idx + 1
+        print(f"\n=== Fold {fold}/{cfg.n_splits} ===")
+
+        # —— 每折都重新实例化模型与训练组件 —— #
+        model     = generate_model(cfg)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg.lr,
+            weight_decay=getattr(cfg, 'weight_decay', 0)
+        )
+        scheduler = CosineAnnealingLR(optimizer, T_max=cfg.num_epochs)
+        scaler    = GradScaler(enabled=getattr(cfg, 'fp16', False))
+
+        # —— 获取该折的 DataLoader —— #
+        tr_loader = fold_loaders[fold_idx]['train_loader']
+        vl_loader = fold_loaders[fold_idx]['val_loader']
+
+        # —— 换成标准交叉熵 —— #
+        criterion = nn.CrossEntropyLoss()   # ⭐ 不再使用加权交叉熵 ⭐
+
+        # —— 为该折创建专属 CSV —— #
+        csv_path = os.path.join(cfg.checkpoint_dir, f"metrics_fold{fold}.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "epoch",
+                "train_Loss","train_ACC","train_PRE","train_SEN","train_SPE","train_F1","train_AUC","train_MCC",
+                "val_Loss","val_ACC"  ,"val_PRE"  ,"val_SEN"  ,"val_SPE"  ,"val_F1"  ,"val_AUC"  ,"val_MCC",
+            ])
+
+        best_auc = -np.inf
+
+        # —— Epoch 循环 —— #
+        for epoch in range(1, cfg.num_epochs + 1):
+            t0 = time.time()
+
+            # -------- Train --------
+            model.train()
+            tr_loss_sum = 0.0
+            tr_batches  = 0
+            yt, yp, ys = [], [], []
+            for batch in tr_loader:
+                # ❶ 从 batch 里取出两模态，并拼通道
+                mri = batch['MRI'].to(cfg.device)    # [B,1,D,H,W]
+                pet = batch['PET'].to(cfg.device)    # [B,1,D,H,W]
+                x   = torch.cat([mri, pet], dim=1)   # [B,2,D,H,W]
+                y   = batch['label'].to(cfg.device).long().view(-1)
+
+                optimizer.zero_grad()
+                with autocast(device_type='cuda', enabled=getattr(cfg, 'fp16', False)):
+                    out  = model(x)
+                    loss = criterion(out, y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                tr_loss_sum += loss.item()
+                tr_batches  += 1
+
+                prob = torch.softmax(out, dim=1)[:, 1].detach().cpu().numpy()
+                pred = out.argmax(1).detach().cpu().numpy()
+                yt.extend(y.cpu().numpy())
+                yp.extend(pred)
+                ys.extend(prob)
+
+            tr_met  = calculate_metrics(yt, yp, ys)
+            tr_loss = tr_loss_sum / tr_batches
+
+            # -------- Validation --------
+            model.eval()
+            vl_loss_sum = 0.0
+            vl_batches  = 0
+            yt, yp, ys = [], [], []
+            with torch.no_grad():
+                for batch in vl_loader:
+                    mri = batch['MRI'].to(cfg.device)
+                    pet = batch['PET'].to(cfg.device)
+                    x   = torch.cat([mri, pet], dim=1)
+                    y   = batch['label'].to(cfg.device).long().view(-1)
+
+                    with autocast(device_type='cuda', enabled=getattr(cfg, 'fp16', False)):
+                        out  = model(x)
+                        loss = criterion(out, y)
+
+                    vl_loss_sum += loss.item()
+                    vl_batches  += 1
+
+                    prob = torch.softmax(out, dim=1)[:, 1].cpu().numpy()
+                    pred = out.argmax(1).cpu().numpy()
+                    yt.extend(y.cpu().numpy())
+                    yp.extend(pred)
+                    ys.extend(prob)
+
+            vl_met  = calculate_metrics(yt, yp, ys)
+            vl_loss = vl_loss_sum / vl_batches
+            scheduler.step()
+
+            print(f"Fold {fold} | Epoch {epoch:03d} | "
+                f"Train Loss={tr_loss:.4f} | Val Loss={vl_loss:.4f} | "
+                f"Train ACC={tr_met['ACC']:.4f} | Val ACC={vl_met['ACC']:.4f} | "
+                f"Train AUC={tr_met['AUC']:.4f} | Val AUC={vl_met['AUC']:.4f} | "
+                f"time={time.time()-t0:.1f}s")
+
+            # —— 保存当前折最佳模型 —— #
+            if vl_met['AUC'] > best_auc:
+                best_auc = vl_met['AUC']
+                torch.save(
+                    model.state_dict(),
+                    os.path.join(cfg.checkpoint_dir, f"best_model_fold{fold}.pth")
+                )
+                print("✅ Fold", fold, "saved best model (AUC={:.4f})".format(best_auc))
+
+            # —— 追加写入 CSV —— #
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    epoch,
+                    f"{tr_loss:.4f}", f"{tr_met['ACC']:.4f}", f"{tr_met['PRE']:.4f}",
+                    f"{tr_met['SEN']:.4f}", f"{tr_met['SPE']:.4f}", f"{tr_met['F1']:.4f}", f"{tr_met['AUC']:.4f}", f"{tr_met['MCC']:.4f}",
+                    f"{vl_loss:.4f}", f"{vl_met['ACC']:.4f}", f"{vl_met['PRE']:.4f}",
+                    f"{vl_met['SEN']:.4f}", f"{vl_met['SPE']:.4f}", f"{vl_met['F1']:.4f}", f"{vl_met['AUC']:.4f}", f"{vl_met['MCC']:.4f}",
+                ])
+
+        print(f"=== Fold {fold} 完成，Best AUC={best_auc:.4f} ===")
+
+if __name__ == '__main__':
+    if os.name == 'nt':
+        freeze_support()
+
+    train()
+
