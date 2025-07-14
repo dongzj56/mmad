@@ -9,7 +9,7 @@
   "augment": false,
   "split_ratio_test": 0.2,
   "seed": 42,
-  "device":"cuda:1",
+  "device":"cuda:0",
   "num_epochs": 100,
   "batch_size": 6,
   "lr": 1e-6,

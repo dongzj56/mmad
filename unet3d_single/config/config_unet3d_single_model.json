@@ -1,6 +1,6 @@
 {
-  "label_file": "C:/Users/dongzj/Desktop/adni_dataset/ADNI_902.csv",
-  "mri_dir": "C:/Users/dongzj/Desktop/adni_dataset/MRI",
+  "label_file": "C:/Users/dongzj/Desktop/Multimodal_AD/adni_dataset/ADNI_902.csv",
+  "mri_dir": "C:/Users/dongzj/Desktop/Multimodal_AD/adni_dataset/MRI",
   "task": "ADCN",
   "augment": false,
   "split_ratio_test": 0.2,
@@ -11,7 +11,7 @@
   "lr": 1e-6,
   "weight_decay": 1e-4,
   "fp16":true,
-  "checkpoint_dir": "C:/Users/dongzj/Desktop/实验结果/checkpoints-adcn-mri",
+  "checkpoint_dir": "checkpoints-adcn-mri",
   "nb_class": 2,
   "n_splits":5,
   "dropout_rate":0.5,
